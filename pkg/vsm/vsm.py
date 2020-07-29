@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 from pkg.index import (
     OttawaUIndexBuilder,
     ReutersIndexBuilder,
@@ -23,7 +25,7 @@ class VectorSpaceModel:
         self.normalize_funcs = context.normalizer_funcs_for_context(ctx)
         self.filter_funcs = context.filter_funcs_for_context(ctx)
 
-    def search(self, ctx, query):
+    def search(self, ctx, query, topic, relevance=[]):
         # ensure accessors exist
         self.setup(ctx)
 
@@ -31,20 +33,84 @@ class VectorSpaceModel:
         query_terms = self.__clean_query(query)
 
         # get all docs that have at least one of the query terms in them
-        relevant_docIDs = set()
+        matched_doc_ids = set()
         for term in query_terms:
             docIDs = self.index_accessor.access(ctx, term).doc_ids
             for doc in docIDs:
-                relevant_docIDs.add(doc)
+                matched_doc_ids.add(doc)
+
+        filtered_doc_ids = set()
+        if ctx.corpus_type() == "reuters" and topic != "ALL TOPICS":
+            for doc in self.corpus_accessor.access(ctx, matched_doc_ids):
+                if topic in doc.topics:
+                    filtered_doc_ids.add(doc.id)
+        else:
+            filtered_doc_ids = matched_doc_ids
+
+        if len(filtered_doc_ids) == 0:
+            return []
 
         weights = {}
 
-        # calculate similarity between query and document (dot product)
-        for docID in relevant_docIDs:
-            weight = 0
-            for term in query_terms:
-                weight += self.weighted_index_accessor.access(ctx, term)[docID]
-            weights[docID] = weight
+        # do rocchio if relevance is present
+        if len(relevance) > 0:
+            relevant_doc_ids = [doc[1] for doc in relevance]
+            not_relevant_doc_ids = [
+                docID for docID in filtered_doc_ids if docID not in relevant_doc_ids
+            ]
+
+            raw_relevant = [
+                (r, k[4].count(r)) for k in relevance for r in k[4].split(" ")
+            ]
+
+            beta_coefficient = 1.0 / (len(relevance))
+            betas = defaultdict(lambda: 0)
+            for raw in raw_relevant:
+                betas[raw[0]] += raw[1]
+            for query_term in query_terms:
+                betas[query_term] += 1
+
+            beta_result = {k: beta_coefficient * v for (k, v) in betas.items()}
+            print(f"betas: {beta_result}")
+
+            gamma_coefficient = 1.0 / (len(filtered_doc_ids) - len(relevant_doc_ids))
+            docs = self.corpus_accessor.access(
+                self.ctx, [doc_id for doc_id in not_relevant_doc_ids]
+            )
+            raw_not_relevant = [
+                (r, k.read_queryable().count(r))
+                for k in docs
+                for r in k.read_queryable().split(" ")
+            ]
+            gammas = defaultdict(lambda: 0)
+            for raw in raw_not_relevant:
+                gammas[raw[0]] += raw[1]
+            gamma_result = {k: gamma_coefficient * v for (k, v) in gammas.items()}
+            print(f"gammas: {gamma_result}")
+
+            query_vector = {k: 1 for k in query_terms}
+
+            # We now have the original query vector, as well as the relevant and non-relevant biases
+            for docID in filtered_doc_ids:
+                weight = 0
+                for term in query_terms:
+                    term_weight = (
+                        query_vector[term] + beta_result[term] - gamma_result[term]
+                    )
+                    weight += (
+                        term_weight
+                        * self.weighted_index_accessor.access(ctx, term)[docID]
+                    )
+                weights[docID] = weight
+
+        else:
+            # calculate similarity between query and document (dot product)
+            for docID in filtered_doc_ids:
+                weight = 0
+                for term in query_terms:
+                    weight += self.weighted_index_accessor.access(ctx, term)[docID]
+                weights[docID] = weight
+
 
         sorted_weights = sorted(weights.items(), reverse=True, key=lambda kv: kv[1])
         # SOURCE: https://stackoverflow.com/questions/613183/how-do-i-sort-a-dictionary-by-value
@@ -57,11 +123,11 @@ class VectorSpaceModel:
     # performs preprocessing on query
     def __clean_query(self, query):
         # split query on space
-        query_terms = query.split()
+        terms = query.split()
 
         # apply normalizations/filters as specified in ctx
         results = []
-        for term in query_terms:
+        for term in terms:
             for normalize_func in self.normalize_funcs:
                 term = normalize_func(term)
             term = set([term])
